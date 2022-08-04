@@ -8,6 +8,7 @@ from naslib.optimizers.oneshot.darts.optimizer import DARTSOptimizer
 logger = logging.getLogger(__name__)
 from naslib.utils.utils import iter_flatten, AttrDict
 
+
 class GDASOptimizer(DARTSOptimizer):
     """
     Implements GDAS as defined in
@@ -17,11 +18,11 @@ class GDASOptimizer(DARTSOptimizer):
     """
 
     def __init__(
-        self,
-        config,
-        op_optimizer: torch.optim.Optimizer = torch.optim.SGD,
-        arch_optimizer: torch.optim.Optimizer = torch.optim.Adam,
-        loss_criteria=torch.nn.CrossEntropyLoss(),
+            self,
+            config,
+            op_optimizer: torch.optim.Optimizer = torch.optim.SGD,
+            arch_optimizer: torch.optim.Optimizer = torch.optim.Adam,
+            loss_criteria=torch.nn.CrossEntropyLoss(),
     ):
         """
         Instantiate the optimizer
@@ -45,7 +46,8 @@ class GDASOptimizer(DARTSOptimizer):
         self.tau_step = (self.tau_min - self.tau_max) / self.epochs
         self.tau_curr = torch.Tensor([self.tau_max])  # make it checkpointable
         self.group_gumbels = {}
-        
+        self.groups = {}
+
     @staticmethod
     def update_ops(edge):
         """
@@ -53,7 +55,11 @@ class GDASOptimizer(DARTSOptimizer):
         with the GDAS specific GDASMixedOp.
         """
         primitives = edge.data.op
-        edge.data.set("op", GDASMixedOp(primitives))
+        mixedop = edge.data.get("mixed_op_type", None)
+        if mixedop == "cross_op":
+            edge.data.set("op", GDASMixedOpCross(primitives))
+        else:
+            edge.data.set("op", GDASMixedOp(primitives))
 
     def adapt_search_space(self, search_space, scope=None):
         """
@@ -74,7 +80,33 @@ class GDASOptimizer(DARTSOptimizer):
         self.tau_curr += self.tau_step
         logger.info("tau {}".format(self.tau_curr))
 
-    def sample_alphas(self,edge, tau):
+    def sample_group_alphas(self):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        for k, v in self.groups.items():
+            arch_parameters = torch.unsqueeze(v, dim=0)
+            while True:
+                gumbels = -torch.empty_like(arch_parameters).exponential_().log()
+                gumbels = gumbels.to(device)
+                tau = tau.to(device)
+                arch_parameters = arch_parameters.to(device)
+                logits = (arch_parameters.log_softmax(dim=1) + gumbels) / tau
+                probs = torch.nn.functional.softmax(logits, dim=1)
+                index = probs.max(-1, keepdim=True)[1]
+                one_h = torch.zeros_like(logits).scatter_(-1, index, 1.0)
+                hardwts = one_h - probs.detach() + probs
+                if (
+                        (torch.isinf(gumbels).any())
+                        or (torch.isinf(probs).any())
+                        or (torch.isnan(probs).any())
+                ):
+                    continue
+                else:
+                    break
+            weights = hardwts[0]
+            argmaxs = index[0].item()
+            self.group_gumbels[k] = weights
+
+    def sample_alphas(self, edge, tau):
         # sampled_arch_weight = torch.nn.functional.gumbel_softmax(
         #     edge.data.alpha, tau=float(tau), hard=True
         # )
@@ -83,40 +115,37 @@ class GDASOptimizer(DARTSOptimizer):
         # from gdas repo
         # https://github.com/D-X-Y/AutoDL-Projects/blob/befa6bcb00e0a8fcfba447d2a1348202759f58c9/lib/models/cell_searchs/search_model_gdas.py#L88
         # https://github.com/D-X-Y/AutoDL-Projects/blob/befa6bcb00e0a8fcfba447d2a1348202759f58c9/lib/models/cell_searchs/search_cells.py#L51
+        group = edge.data.get("group", None)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if hasattr(edge.data, 'alpha'):
-           arch_parameters = torch.unsqueeze(edge.data.alpha, dim=0)
-        else:
-           arch_parameters = torch.unsqueeze(torch.Tensor([x*y for x in torch.softmax(edge.data.alpha_p1,dim=-1) for y in torch.softmax(edge.data.alpha_p2,dim=-1)]), dim =0)
-        
-        group = edge.data.group
-        while True:
-            if group not in self.group_gumbels.keys():
-               self.group_gumbels[group]= -torch.empty_like(arch_parameters).exponential_().log()
-            #gumbels = -torch.empty_like(arch_parameters).exponential_().log()
-            gumbels = self.group_gumbels[group]
-            gumbels = gumbels.to(device)
-            tau = tau.to(device)
-            arch_parameters = arch_parameters.to(device)
-            logits = (arch_parameters.log_softmax(dim=1) + gumbels) / tau
-            probs = torch.nn.functional.softmax(logits, dim=1)
-            index = probs.max(-1, keepdim=True)[1]
-            one_h = torch.zeros_like(logits).scatter_(-1, index, 1.0)
-            hardwts = one_h - probs.detach() + probs
-            if (
-                (torch.isinf(gumbels).any())
-                or (torch.isinf(probs).any())
-                or (torch.isnan(probs).any())
-            ):
-                continue
-            else:
-                break
 
-        weights = hardwts[0]
-        argmaxs = index[0].item()
+        if type(edge.data.group) == list:
+            weights = torch.nn.ParameterList([self.group_gumbels[i] for i in group])
+        elif group in self.group_gumbels.keys():
+            weights = self.group_gumbels[group]
+        else:
+            arch_parameters = torch.unsqueeze(edge.data.alpha, dim=0)
+            while True:
+                gumbels = -torch.empty_like(arch_parameters).exponential_().log()
+                gumbels = gumbels.to(device)
+                tau = tau.to(device)
+                arch_parameters = arch_parameters.to(device)
+                logits = (arch_parameters.log_softmax(dim=1) + gumbels) / tau
+                probs = torch.nn.functional.softmax(logits, dim=1)
+                index = probs.max(-1, keepdim=True)[1]
+                one_h = torch.zeros_like(logits).scatter_(-1, index, 1.0)
+                hardwts = one_h - probs.detach() + probs
+                if (
+                        (torch.isinf(gumbels).any())
+                        or (torch.isinf(probs).any())
+                        or (torch.isnan(probs).any())
+                ):
+                    continue
+                else:
+                    break
+            weights = hardwts[0]
+            argmaxs = index[0].item()
 
         edge.data.set("sampled_arch_weight", weights, shared=True)
-        edge.data.set("argmax", argmaxs, shared=True)
 
     @staticmethod
     def remove_sampled_alphas(edge):
@@ -128,10 +157,10 @@ class GDASOptimizer(DARTSOptimizer):
         input_val, target_val = data_val
 
         # sample alphas and set to edges
-        for u,v, edge_data in self.graph.edges.data():
+        for u, v, edge_data in self.graph.edges.data():
             if not edge_data.is_final():
-             edge = AttrDict(head=u, tail=v, data=edge_data)
-             self.sample_alphas(edge, self.tau_curr)
+                edge = AttrDict(head=u, tail=v, data=edge_data)
+                self.sample_alphas(edge, self.tau_curr)
         # Update architecture weights
         self.arch_optimizer.zero_grad()
         logits_val = self.graph(input_val)
@@ -146,10 +175,10 @@ class GDASOptimizer(DARTSOptimizer):
         # has to be done again, cause val_loss.backward() frees the gradient from sampled alphas
         # TODO: this is not how it is intended because the samples are now different. Another
         # option would be to set val_loss.backward(retain_graph=True) but that requires more memory.
-        for u,v, edge_data in self.graph.edges.data():
+        for u, v, edge_data in self.graph.edges.data():
             if not edge_data.is_final():
-             edge = AttrDict(head=u, tail=v, data=edge_data)
-             self.sample_alphas(edge, self.tau_curr)
+                edge = AttrDict(head=u, tail=v, data=edge_data)
+                self.sample_alphas(edge, self.tau_curr)
         # Update op weights
         self.op_optimizer.zero_grad()
         logits_train = self.graph(input_train)
@@ -160,7 +189,7 @@ class GDASOptimizer(DARTSOptimizer):
         self.op_optimizer.step()
 
         # in order to properly unparse remove the alphas again
-        self.group_gumbels={}
+        self.group_gumbels = {}
         self.graph.update_edges(
             update_func=self.remove_sampled_alphas,
             scope=self.scope,
@@ -187,7 +216,7 @@ class GDASMixedOp(MixedOp):
     def process_weights(self, weights):
         return weights
 
-    def apply_weights(self, x, weights,edge_data):
+    def apply_weights(self, x, weights):
         """
         Applies the gumbel softmax to the architecture weights
         before forwarding `x` through the graph as in DARTS
@@ -196,7 +225,43 @@ class GDASMixedOp(MixedOp):
         argmax = torch.argmax(weights)
 
         weighted_sum = sum(
-            weights[i] * op(x,edge_data).cuda() if i == argmax else weights[i]
+            weights[i] * op(x, None).cuda() if i == argmax else weights[i]
+            for i, op in enumerate(self.primitives)
+        )
+
+        return weighted_sum
+
+
+class GDASMixedOpCross(MixedOp):
+    def __init__(self, primitives, min_cuda_memory=False):
+        """
+        Initialize the mixed op for GDAS.
+
+        Args:
+            primitives (list): The primitive operations to sample from.
+        """
+        super().__init__(primitives)
+        self.min_cuda_memory = min_cuda_memory
+
+    def get_weights(self, edge_data):
+        return edge_data.sampled_arch_weight
+
+    def process_weights(self, weights):
+        weights = torch.softmax(weights, dim=-1)
+        len = weights[0].shape[0]
+        weights = weights[0].reshape(len, 1) @ weights[1].reshape(1, len)
+        return weights.flatten()
+
+    def apply_weights(self, x, weights):
+        """
+        Applies the gumbel softmax to the architecture weights
+        before forwarding `x` through the graph as in DARTS
+        """
+
+        argmax = torch.argmax(weights)
+
+        weighted_sum = sum(
+            weights[i] * op(x, None).cuda() if i == argmax else weights[i]
             for i, op in enumerate(self.primitives)
         )
 

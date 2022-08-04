@@ -18,28 +18,23 @@ class DARTSOptimizer(MetaOptimizer):
     Implementation of the DARTS paper as in
         Liu et al. 2019: DARTS: Differentiable Architecture Search.
     """
-    
-    def add_group_alphas(self,group_name,len_primitives):
+
+    def add_group_alphas(self, group_name, len_primitives):
         alpha = torch.nn.Parameter(
             1e-3 * torch.randn(size=[len_primitives], requires_grad=True)
         )
-        self.groups[group_name] = alpha #.cuda()
+        self.groups[group_name] = alpha  # .cuda()
 
-    def add_alphas(self,edge):
+    def add_alphas(self, edge):
         """
         Function to add the architectural weights to the edges.
         """
-        #print("Group",edge.data)
-        #print("Group",edge.data.op)
-        group = edge.data.group
-        if group in self.groups.keys():
+        group = edge.data.get("group", None)
+        if type(group) == list:
+            alpha = torch.nn.ParameterList([self.groups[i] for i in group])
+            edge.data.set("alpha", alpha, shared=True)
+        elif group in self.groups:
             edge.data.set("alpha", self.groups[group], shared=True)
-        elif group == "combi":
-            #alpha = torch.Tensor([x*y for x in torch.softmax(self.groups[edge.data.p1],dim=-1) for y in torch.softmax(self.groups[edge.data.p2],dim=-1)])
-            #alpha = alpha.to("cuda")
-            #print(alpha)
-            edge.data.set("alpha_p1", self.groups[edge.data.p1] , shared=True)
-            edge.data.set("alpha_p2", self.groups[edge.data.p2] , shared=True)
         else:
             len_primitives = len(edge.data.op)
             alpha = torch.nn.Parameter(1e-3 * torch.randn(size=[len_primitives], requires_grad=True))
@@ -52,15 +47,18 @@ class DARTSOptimizer(MetaOptimizer):
         with the DARTS specific MixedOp.
         """
         primitives = edge.data.op
-        #print("Primitives",primitives)
-        edge.data.set("op", DARTSMixedOp(primitives))
+        mixedop = edge.data.get("mixed_op_type", None)
+        if mixedop == "cross_op":
+            edge.data.set("op", DARTSMixedOpCross(primitives))
+        else:
+            edge.data.set("op", DARTSMixedOp(primitives))
 
     def __init__(
-        self,
-        config,
-        op_optimizer=torch.optim.SGD,
-        arch_optimizer=torch.optim.Adam,
-        loss_criteria=torch.nn.CrossEntropyLoss(),
+            self,
+            config,
+            op_optimizer=torch.optim.SGD,
+            arch_optimizer=torch.optim.Adam,
+            loss_criteria=torch.nn.CrossEntropyLoss(),
     ):
         """
         Initialize a new instance.
@@ -69,7 +67,7 @@ class DARTSOptimizer(MetaOptimizer):
 
         """
         super(DARTSOptimizer, self).__init__()
-        self.groups={}
+        self.groups = {}
         self.config = config
         self.op_optimizer = op_optimizer
         self.arch_optimizer = arch_optimizer
@@ -89,43 +87,29 @@ class DARTSOptimizer(MetaOptimizer):
         self.search_space = search_space
         graph = search_space.clone()
 
+        for k, v in self.search_space.groups.items():
+            self.add_group_alphas(group_name=k, len_primitives=v)
         # If there is no scope defined, let's use the search space default one
         if not scope:
             scope = graph.OPTIMIZER_SCOPE
-        import math
-        for u,v, edge_data in graph.edges.data():
-            if not edge_data.is_final():
-             edge = AttrDict(head=u, tail=v, data=edge_data)
-             #print(edge)
-             group = edge.data.group
-             if group not in self.groups.keys():
-                if group!="combi":
-                    self.add_group_alphas(group,len(edge.data.op))  
-                else:
-                    self.add_group_alphas("ratio",3)      
 
         # 1. add alphas
-    
-        for u,v, edge_data in graph.edges.data():
-            if not edge_data.is_final():
-             edge = AttrDict(head=u, tail=v, data=edge_data)
-             self.add_alphas(edge)
-        #graph.update_edges(
-        #    self.__class__.add_alphas, scope=scope, private_edge_data=False
-        #)
-        for u,v, edge_data in graph.edges.data():
-            if not edge_data.is_final():
-             edge = AttrDict(head=u, tail=v, data=edge_data)
-             edge.data.set("discretize", False, shared=True)
+        graph.update_edges(
+            self.add_alphas, scope=scope, private_edge_data=False
+        )
+
         # 2. replace primitives with mixed_op
         graph.update_edges(
             self.__class__.update_ops, scope=scope, private_edge_data=True
         )
 
-
-
-        for alpha in graph.get_all_edge_data("alpha"):
-            self.architectural_weights.append(alpha)
+        architecture_weights = []
+        for alpha in set(graph.get_all_edge_data("alpha")):
+            if type(alpha) == torch.nn.ParameterList:
+                architecture_weights.extend(alpha)
+            else:
+                architecture_weights.append(alpha)
+        self.architectural_weights.extend(set(alpha))
 
         graph.parse()
         logger.info("Parsed graph:\n" + graph.modules_str())
@@ -142,10 +126,10 @@ class DARTSOptimizer(MetaOptimizer):
         self.op_optimizer = self.op_optimizer(
             graph.parameters(),
             lr=self.config.search.learning_rate,
-  
+
             weight_decay=self.config.search.weight_decay,
         )
-        #momentum=self.config.search.momentum,
+        # momentum=self.config.search.momentum,
         graph.train()
 
         self.graph = graph
@@ -222,12 +206,8 @@ class DARTSOptimizer(MetaOptimizer):
         def discretize_ops(edge):
             if edge.data.has("alpha"):
                 primitives = edge.data.op.get_embedded_ops()
-                alphas = edge.data.alpha.detach().cpu()
-                edge.data.set("op", primitives[np.argmax(alphas)])
-            elif edge.data.has("alpha_p1"):
-                primitives = edge.data.op.get_embedded_ops()
-                alphas = torch.Tensor([x*y for x in torch.softmax(edge.data.alpha_p1,dim=-1) for y in torch.softmax(edge.data.alpha_p2,dim=-1)]).detach().cpu()
-                edge.data.set("op", primitives[np.argmax(alphas)])
+                weights = edge.data.op.process_weights(edge.alpha).detach().cpu()
+                edge.data.set("op", primitives[np.argmax(weights)])
 
         graph.update_edges(discretize_ops, scope=self.scope, private_edge_data=True)
         graph.prepare_evaluation()
@@ -252,16 +232,16 @@ class DARTSOptimizer(MetaOptimizer):
             return None
 
     def _step(
-        self,
-        model,
-        criterion,
-        input_train,
-        target_train,
-        input_valid,
-        target_valid,
-        eta,
-        network_optimizer,
-        unrolled,
+            self,
+            model,
+            criterion,
+            input_train,
+            target_train,
+            input_valid,
+            target_valid,
+            eta,
+            network_optimizer,
+            unrolled,
     ):
         self.optimizer.zero_grad()
         if unrolled:
@@ -290,15 +270,15 @@ class DARTSOptimizer(MetaOptimizer):
         loss.backward()
 
     def _backward_step_unrolled(
-        self,
-        model,
-        criterion,
-        input_train,
-        target_train,
-        input_valid,
-        target_valid,
-        eta,
-        network_optimizer,
+            self,
+            model,
+            criterion,
+            input_train,
+            target_train,
+            input_valid,
+            target_valid,
+            eta,
+            network_optimizer,
     ):
         unrolled_model = self._compute_unrolled_model(
             model, criterion, input_train, target_train, eta, network_optimizer
@@ -334,7 +314,7 @@ class DARTSOptimizer(MetaOptimizer):
                 v.grad.data.copy_(g.data)
 
     def _compute_unrolled_model(
-        self, model, criterion, input, target, eta, network_optimizer
+            self, model, criterion, input, target, eta, network_optimizer
     ):
         loss = self._loss(model=model, criterion=criterion, input=input, target=target)
         theta = _concat(model.parameters()).data
@@ -346,8 +326,8 @@ class DARTSOptimizer(MetaOptimizer):
         except:
             moment = torch.zeros_like(theta)
         dtheta = (
-            _concat(torch.autograd.grad(loss, model.parameters())).data
-            + self.network_weight_decay * theta
+                _concat(torch.autograd.grad(loss, model.parameters())).data
+                + self.network_weight_decay * theta
         )
 
         unrolled_model = self._construct_model_from_theta(
@@ -362,7 +342,7 @@ class DARTSOptimizer(MetaOptimizer):
         params, offset = {}, 0
         for k, v in model.named_parameters():
             v_length = np.prod(v.size())
-            params[k] = theta[offset : offset + v_length].view(v.size())
+            params[k] = theta[offset: offset + v_length].view(v.size())
             offset += v_length
 
         assert offset == len(theta)
@@ -390,7 +370,7 @@ class DARTSOptimizer(MetaOptimizer):
         return [(x - y).div_(2 * R) for x, y in zip(grads_p, grads_n)]
 
     def _loss(self, model, criterion, input, target):
-        #print("Arch Parameters",model.arch_parameters())
+        # print("Arch Parameters",model.arch_parameters())
         pred = model(input)
         return criterion(pred, target)
 
@@ -402,32 +382,37 @@ class DARTSMixedOp(MixedOp):
 
     def __init__(self, primitives):
         super().__init__(primitives)
-    
+
     def get_weights(self, edge_data):
-        #return edge_data.alpha
-        if hasattr(edge_data, 'alpha'):
-           return edge_data.alpha
-        else:
-            alpha = torch.Tensor([x*y for x in torch.softmax(edge_data.alpha_p1,dim=-1) for y in torch.softmax(edge_data.alpha_p2,dim=-1)])
-            return alpha
+        return edge_data.alpha
 
     def process_weights(self, weights):
         return torch.softmax(weights, dim=-1)
 
-    def apply_weights(self, x, weights,edge_data):  
-        #weights = weights.to("cuda")
-        #x = x.to("cuda")
-        li = []
-        #print(self.primitives)
-        for w, op in zip(weights, self.primitives):
-            #op = op.cuda()
-            #print(op)
-            #print(op.device)
-            #print(x.device)
-            #print(w.device)
-            out = op(x,edge_data)
-            li.append(w*out.cuda())
-
-        return sum(li)
+    def apply_weights(self, x, weights):
+        # print(x.shape)
+        # print(w.shape)
+        return sum(w * op(x, None) for w, op in zip(weights, self.primitives))
 
 
+class DARTSMixedOpCross(MixedOp):
+    """
+    Continous relaxation of the discrete search space.
+    """
+
+    def __init__(self, primitives):
+        super().__init__(primitives)
+
+    def get_weights(self, edge_data):
+        return edge_data.alpha
+
+    def process_weights(self, weights):
+        weights = torch.softmax(weights, dim=-1)
+        len = weights[0].shape[0]
+        weights = weights[0].reshape(len, 1) @ weights[1].reshape(1, len)
+        return torch.softmax(weights.flatten(), dim=-1)
+
+    def apply_weights(self, x, weights):
+        # print(x.shape)
+        # print(w.shape)
+        return sum(w * op(x, None) for w, op in zip(weights, self.primitives))
