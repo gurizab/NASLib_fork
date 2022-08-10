@@ -55,11 +55,11 @@ class DARTSOptimizer(MetaOptimizer):
             edge.data.set("op", DARTSMixedOp(primitives))
 
     def __init__(
-            self,
-            config,
-            op_optimizer=torch.optim.SGD,
-            arch_optimizer=torch.optim.Adam,
-            loss_criteria=torch.nn.CrossEntropyLoss(),
+        self,
+        config,
+        op_optimizer=torch.optim.Adam,
+        arch_optimizer=torch.optim.Adam,
+        loss_criteria=torch.nn.CrossEntropyLoss(),
     ):
         """
         Initialize a new instance.
@@ -85,7 +85,7 @@ class DARTSOptimizer(MetaOptimizer):
 
     def adapt_search_space(self, search_space, scope=None, **kwargs):
         # We are going to modify the search space
-        self.search_space= search_space
+        self.search_space = search_space
         graph = search_space.clone()
         if hasattr(self.search_space,'groups'):
             for k, v in self.search_space.groups.items():
@@ -371,7 +371,7 @@ class DARTSOptimizer(MetaOptimizer):
         return [(x - y).div_(2 * R) for x, y in zip(grads_p, grads_n)]
 
     def _loss(self, model, criterion, input, target):
-        #("Arch Parameters",model.arch_parameters())
+        #print("Arch Parameters",model.arch_parameters())
         pred = model(input)
         return criterion(pred, target)
 

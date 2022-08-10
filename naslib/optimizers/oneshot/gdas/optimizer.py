@@ -82,7 +82,7 @@ class GDASOptimizer(DARTSOptimizer):
     def get_gumbels_arch_param(self, edge):
         op = edge.data.get("mixed_op_type", None)
         if op:
-            arch_parameters = edge.data.op.process_alpha_op_weights(edge.data.alpha)
+            arch_parameters = edge.data.op.process_weights(edge.data.alpha)
         else:
             arch_parameters = edge.data.alpha
         arch_parameters = torch.unsqueeze(arch_parameters, dim=0)
@@ -226,7 +226,7 @@ class GDASMixedOp(MixedOp):
         argmax = torch.argmax(weights)
 
         weighted_sum = sum(
-            weights[i] * op(x, edge_data).cuda() if i == argmax else weights[i]
+            weights[i] * op(x, edge_data) if i == argmax else weights[i]
             for i, op in enumerate(self.primitives)
         )
 
@@ -247,14 +247,14 @@ class GDASMixedOpCross(MixedOp):
     def get_weights(self, edge_data):
         return edge_data.sampled_arch_weight
 
-    def process_alpha_op_weights(self, weights):
-        x1 = torch.softmax(weights[0], dim=-1)
-        x2 = torch.softmax(weights[1], dim=-1)
-        weights = x1.reshape(x1.shape[0], 1) @ x2.reshape(1, x2.shape[0])
-        return torch.softmax(weights.flatten(), dim=-1)
-
     def process_weights(self, weights):
-        return weights
+        if type(weights) == torch.nn.ParameterList:
+            x1 = torch.softmax(weights[0], dim=-1)
+            x2 = torch.softmax(weights[1], dim=-1)
+            weights = x1.reshape(x1.shape[0], 1) @ x2.reshape(1, x2.shape[0])
+            return torch.softmax(weights.flatten(), dim=-1)
+        else:
+            return weights
 
     def apply_weights(self, x, weights, edge_data):
         """
@@ -265,7 +265,7 @@ class GDASMixedOpCross(MixedOp):
         argmax = torch.argmax(weights)
 
         weighted_sum = sum(
-            weights[i] * op(x, edge_data).cuda() if i == argmax else weights[i]
+            weights[i] * op(x,edge_data) if i == argmax else weights[i]
             for i, op in enumerate(self.primitives)
         )
 

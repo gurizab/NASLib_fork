@@ -10,7 +10,7 @@ from naslib.search_spaces.core.primitives import AbstractPrimitive, MixedOp
 from naslib.optimizers.oneshot.darts.optimizer import DARTSOptimizer
 from naslib.utils.utils import count_parameters_in_MB
 from naslib.search_spaces.core.query_metrics import Metric
-
+from naslib.utils.utils import iter_flatten, AttrDict
 import naslib.search_spaces.core.primitives as ops
 
 logger = logging.getLogger(__name__)
@@ -27,7 +27,7 @@ class DrNASOptimizer(DARTSOptimizer):
     def beta(self, edge):
         op = edge.data.get("mixed_op_type", None)
         if op:
-            beta = F.elu(edge.data.op.process_alpha_op_weights(edge.data.alpha)) + 1
+            beta = F.elu(edge.data.op.process_weights(edge.data.alpha)) + 1
             weights = torch.distributions.dirichlet.Dirichlet(beta).rsample()
         else:
             beta = F.elu(edge.data.alpha) + 1
@@ -84,7 +84,7 @@ class DrNASOptimizer(DARTSOptimizer):
 
         """
         super().__init__(config, op_optimizer, arch_optimizer, loss_criteria)
-        self.reg_type = "l2"
+        self.reg_type = "kl"
         self.reg_scale = 1e-3
         # self.reg_scale = config.reg_scale
         self.epochs = config.search.epochs
@@ -101,9 +101,9 @@ class DrNASOptimizer(DARTSOptimizer):
         """
         super().adapt_search_space(search_space, scope)
         self.anchor = Dirichlet(
-            torch.ones_like(
-                torch.nn.utils.parameters_to_vector(self.architectural_weights)
-            ).to(self.device)
+            torch.ones(
+                torch.nn.utils.parameters_to_vector(self.architectural_weights).shape
+            )
         )
 
     def step(self, data_train, data_val):
@@ -126,7 +126,7 @@ class DrNASOptimizer(DARTSOptimizer):
         if self.reg_type == "kl":
             val_loss += self._get_kl_reg()
 
-        val_loss.backward()
+        val_loss.backward(retain_graph=True)
 
         if self.grad_clip:
             torch.nn.utils.clip_grad_norm_(
@@ -213,7 +213,7 @@ class DrNASMixedOp(MixedOp):
 
     def apply_weights(self, x, weights, edge_data):
         weighted_sum = sum(
-            w.cuda() * op(x, edge_data).cuda()
+            w * op(x, edge_data)
             for w, op in zip(weights, self.primitives)
         )
         return weighted_sum
@@ -230,18 +230,19 @@ class DrNASMixedOpCross(MixedOp):
     def get_weights(self, edge_data):
         return edge_data.sampled_arch_weight
 
-    def process_alpha_op_weights(self, weights):
-        x1 = torch.softmax(weights[0], dim=-1)
-        x2 = torch.softmax(weights[1], dim=-1)
-        weights = x1.reshape(x1.shape[0], 1) @ x2.reshape(1, x2.shape[0])
-        return torch.softmax(weights.flatten(), dim=-1)
 
     def process_weights(self, weights):
-        return weights
+        if type(weights)==torch.nn.ParameterList:
+            x1 = torch.softmax(weights[0], dim=-1)
+            x2 = torch.softmax(weights[1], dim=-1)
+            weights = x1.reshape(x1.shape[0], 1) @ x2.reshape(1, x2.shape[0])
+            return torch.softmax(weights.flatten(), dim=-1)
+        else:
+            return weights
 
     def apply_weights(self, x, weights, edge_data):
         weighted_sum = sum(
-            w.cuda() * op(x, edge_data).cuda()
+            w * op(x, edge_data)
             for w, op in zip(weights, self.primitives)
         )
         return weighted_sum

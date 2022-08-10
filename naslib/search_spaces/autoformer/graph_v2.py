@@ -57,7 +57,7 @@ class AutoformerSearchSpace(Graph):
 
     def __init__(self,
                  img_size=32,
-                 patch_size=4,
+                 patch_size=2,
                  in_chans=3,
                  num_classes=10,
                  embed_dim=768,
@@ -111,7 +111,6 @@ class AutoformerSearchSpace(Graph):
         }
         # operations at the edges
         #
-
         self.change_qkv = change_qkv
         self.scale = scale
         self.depth_super = max(self.choices["depth"])
