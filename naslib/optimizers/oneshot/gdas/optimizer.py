@@ -46,7 +46,6 @@ class GDASOptimizer(DARTSOptimizer):
         self.tau_step = (self.tau_min - self.tau_max) / self.epochs
         self.tau_curr = torch.Tensor([self.tau_max])  # make it checkpointable
         self.group_gumbels = {}
-        self.groups = {}
 
     @staticmethod
     def update_ops(edge):
@@ -80,12 +79,13 @@ class GDASOptimizer(DARTSOptimizer):
         self.tau_curr += self.tau_step
         logger.info("tau {}".format(self.tau_curr))
 
-    def get_gumbels_arch_param(self,edge):
+    def get_gumbels_arch_param(self, edge):
         op = edge.data.get("mixed_op_type", None)
         if op:
-            arch_parameters = edge.data.op.process_weights(edge.data.alpha)
+            arch_parameters = edge.data.op.process_alpha_op_weights(edge.data.alpha)
         else:
-            arch_parameters= edge.data.alpha
+            arch_parameters = edge.data.alpha
+        arch_parameters = torch.unsqueeze(arch_parameters, dim=0)
         gumbels = -torch.empty_like(arch_parameters).exponential_().log()
         return gumbels, arch_parameters
 
@@ -98,26 +98,22 @@ class GDASOptimizer(DARTSOptimizer):
         # from gdas repo
         # https://github.com/D-X-Y/AutoDL-Projects/blob/befa6bcb00e0a8fcfba447d2a1348202759f58c9/lib/models/cell_searchs/search_model_gdas.py#L88
         # https://github.com/D-X-Y/AutoDL-Projects/blob/befa6bcb00e0a8fcfba447d2a1348202759f58c9/lib/models/cell_searchs/search_cells.py#L51
-        group = edge.data.get("group", None)
+
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         group = edge.data.get("group", None)
         gumbels = None
+
         if group:
+
+            group = "_".join(group) if type(group) == list else group
             op = edge.data.get("mixed_op_type", None)
-            if edge.data.alpha not in self.sampled_groups.keys():
-                if op and op in self.sampled_groups[edge.data.alpha].keys():
-                    gumbels, arch_parameters = self.sampled_groups[edge.data.alpha][op]
-                elif op:
-                    gumbels, arch_parameters = self.get_gumbels(edge)
-                    self.sampled_groups[edge.data.alpha][op] = (gumbels, arch_parameters)
-                else:
-                    gumbels, arch_parameters = self.sampled_groups[edge.data.alpha]
+            group = group + op if op else group
+
+            if group in self.group_gumbels.keys():
+                gumbels, arch_parameters = self.group_gumbels[group]
             else:
                 gumbels, arch_parameters = self.get_gumbels_arch_param(edge)
-                if op:
-                    self.sampled_groups[edge.data.alpha] = {op: (gumbels, arch_parameters)}
-                else:
-                    self.sampled_groups[edge.data.alpha] = (gumbels, arch_parameters)
+                self.group_gumbels[group] = (gumbels, arch_parameters)
         else:
             gumbels, arch_parameters = self.get_gumbels_arch_param(edge)
 
@@ -152,12 +148,14 @@ class GDASOptimizer(DARTSOptimizer):
     def step(self, data_train, data_val):
         input_train, target_train = data_train
         input_val, target_val = data_val
-
         # sample alphas and set to edges
-        for u, v, edge_data in self.graph.edges.data():
-            if not edge_data.is_final():
-                edge = AttrDict(head=u, tail=v, data=edge_data)
-                self.sample_alphas(edge, self.tau_curr)
+        self.group_gumbels = {}
+        self.graph.update_edges(
+            update_func=lambda edge: self.sample_alphas(edge=edge, tau=self.tau_curr),
+            scope=self.scope,
+            private_edge_data=False,
+        )
+
         # Update architecture weights
         self.arch_optimizer.zero_grad()
         logits_val = self.graph(input_val)
@@ -172,10 +170,16 @@ class GDASOptimizer(DARTSOptimizer):
         # has to be done again, cause val_loss.backward() frees the gradient from sampled alphas
         # TODO: this is not how it is intended because the samples are now different. Another
         # option would be to set val_loss.backward(retain_graph=True) but that requires more memory.
-        for u, v, edge_data in self.graph.edges.data():
-            if not edge_data.is_final():
-                edge = AttrDict(head=u, tail=v, data=edge_data)
-                self.sample_alphas(edge, self.tau_curr)
+
+        # sample alphas and set to edges
+
+        self.group_gumbels = {}
+        self.graph.update_edges(
+            update_func=lambda edge: self.sample_alphas(edge=edge, tau=self.tau_curr),
+            scope=self.scope,
+            private_edge_data=False,
+        )
+
         # Update op weights
         self.op_optimizer.zero_grad()
         logits_train = self.graph(input_train)
@@ -213,7 +217,7 @@ class GDASMixedOp(MixedOp):
     def process_weights(self, weights):
         return weights
 
-    def apply_weights(self, x, weights):
+    def apply_weights(self, x, weights, edge_data):
         """
         Applies the gumbel softmax to the architecture weights
         before forwarding `x` through the graph as in DARTS
@@ -222,7 +226,7 @@ class GDASMixedOp(MixedOp):
         argmax = torch.argmax(weights)
 
         weighted_sum = sum(
-            weights[i] * op(x, None).cuda() if i == argmax else weights[i]
+            weights[i] * op(x, edge_data).cuda() if i == argmax else weights[i]
             for i, op in enumerate(self.primitives)
         )
 
@@ -243,13 +247,16 @@ class GDASMixedOpCross(MixedOp):
     def get_weights(self, edge_data):
         return edge_data.sampled_arch_weight
 
-    def process_weights(self, weights):
-        weights = torch.softmax(weights, dim=-1)
-        len = weights[0].shape[0]
-        weights = weights[0].reshape(len, 1) @ weights[1].reshape(1, len)
-        return weights.flatten()
+    def process_alpha_op_weights(self, weights):
+        x1 = torch.softmax(weights[0], dim=-1)
+        x2 = torch.softmax(weights[1], dim=-1)
+        weights = x1.reshape(x1.shape[0], 1) @ x2.reshape(1, x2.shape[0])
+        return torch.softmax(weights.flatten(), dim=-1)
 
-    def apply_weights(self, x, weights):
+    def process_weights(self, weights):
+        return weights
+
+    def apply_weights(self, x, weights, edge_data):
         """
         Applies the gumbel softmax to the architecture weights
         before forwarding `x` through the graph as in DARTS
@@ -258,7 +265,7 @@ class GDASMixedOpCross(MixedOp):
         argmax = torch.argmax(weights)
 
         weighted_sum = sum(
-            weights[i] * op(x, None).cuda() if i == argmax else weights[i]
+            weights[i] * op(x, edge_data).cuda() if i == argmax else weights[i]
             for i, op in enumerate(self.primitives)
         )
 

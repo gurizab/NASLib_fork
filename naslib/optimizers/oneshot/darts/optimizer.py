@@ -39,6 +39,7 @@ class DARTSOptimizer(MetaOptimizer):
             len_primitives = len(edge.data.op)
             alpha = torch.nn.Parameter(1e-3 * torch.randn(size=[len_primitives], requires_grad=True))
             edge.data.set("alpha", alpha, shared=True)
+        edge.data.set("discretize", False, shared=True)
 
     @staticmethod
     def update_ops(edge):
@@ -84,11 +85,11 @@ class DARTSOptimizer(MetaOptimizer):
 
     def adapt_search_space(self, search_space, scope=None, **kwargs):
         # We are going to modify the search space
-        self.search_space = search_space
+        self.search_space= search_space
         graph = search_space.clone()
-
-        for k, v in self.search_space.groups.items():
-            self.add_group_alphas(group_name=k, len_primitives=v)
+        if hasattr(self.search_space,'groups'):
+            for k, v in self.search_space.groups.items():
+                self.add_group_alphas(group_name=k, len_primitives=v)
         # If there is no scope defined, let's use the search space default one
         if not scope:
             scope = graph.OPTIMIZER_SCOPE
@@ -109,7 +110,7 @@ class DARTSOptimizer(MetaOptimizer):
                 architecture_weights.extend(alpha)
             else:
                 architecture_weights.append(alpha)
-        self.architectural_weights.extend(set(alpha))
+        self.architectural_weights.extend(set(architecture_weights))
 
         graph.parse()
         logger.info("Parsed graph:\n" + graph.modules_str())
@@ -370,7 +371,7 @@ class DARTSOptimizer(MetaOptimizer):
         return [(x - y).div_(2 * R) for x, y in zip(grads_p, grads_n)]
 
     def _loss(self, model, criterion, input, target):
-        # print("Arch Parameters",model.arch_parameters())
+        #("Arch Parameters",model.arch_parameters())
         pred = model(input)
         return criterion(pred, target)
 
@@ -389,10 +390,8 @@ class DARTSMixedOp(MixedOp):
     def process_weights(self, weights):
         return torch.softmax(weights, dim=-1)
 
-    def apply_weights(self, x, weights):
-        # print(x.shape)
-        # print(w.shape)
-        return sum(w * op(x, None) for w, op in zip(weights, self.primitives))
+    def apply_weights(self, x, weights, edge_data):
+        return sum(w * op(x, edge_data) for w, op in zip(weights, self.primitives))
 
 
 class DARTSMixedOpCross(MixedOp):
@@ -407,12 +406,10 @@ class DARTSMixedOpCross(MixedOp):
         return edge_data.alpha
 
     def process_weights(self, weights):
-        weights = torch.softmax(weights, dim=-1)
-        len = weights[0].shape[0]
-        weights = weights[0].reshape(len, 1) @ weights[1].reshape(1, len)
-        return torch.softmax(weights.flatten(), dim=-1)
+        x1 = torch.softmax(weights[0], dim=-1)
+        x2 = torch.softmax(weights[1], dim=-1)
+        weights = x1.reshape(x1.shape[0], 1) @ x2.reshape(1, x2.shape[0])
+        return torch.softmax(weights.flatten(),dim=-1)
 
-    def apply_weights(self, x, weights):
-        # print(x.shape)
-        # print(w.shape)
-        return sum(w * op(x, None) for w, op in zip(weights, self.primitives))
+    def apply_weights(self, x, weights, edge_data):
+        return sum(w * op(x, edge_data) for w, op in zip(weights, self.primitives))

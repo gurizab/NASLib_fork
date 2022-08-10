@@ -128,7 +128,7 @@ class AutoformerSearchSpace(Graph):
                              for i in range(1, self.total_num_nodes)])
 
         self.groups = {"embed_dim": len(self.choices["embed_dim"])}
-        for i in range(1, self.depth_super+1):
+        for i in range(self.depth_super):
             self.groups["num_heads_" + str(i)] = len(self.choices["num_heads"])
             self.groups["mlp_ratio_" + str(i)] = len(self.choices["mlp_ratio"])
 

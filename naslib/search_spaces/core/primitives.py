@@ -122,7 +122,7 @@ class MixedOp(AbstractPrimitive):
         if self.post_process_hook:
             weights = self.post_process_hook(weights, edge_data)
 
-        return self.apply_weights(x, weights)
+        return self.apply_weights(x, weights, edge_data)
 
     def get_embedded_ops(self):
         return self.primitives
