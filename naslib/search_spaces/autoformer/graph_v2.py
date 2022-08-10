@@ -108,6 +108,7 @@ class AutoformerSearchSpace(Graph):
             'mlp_ratio': [3.5, 4],
             'embed_dim': [192, 216, 240],
             'depth': [12, 13, 14]
+            #'depth' : [4,5]
         }
         # operations at the edges
         #

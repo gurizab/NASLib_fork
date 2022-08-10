@@ -41,7 +41,7 @@ class DrNASOptimizer(DARTSOptimizer):
 
             group = "_".join(group) if type(group) == list else group
             op = edge.data.get("mixed_op_type", None)
-            group = group+op if op else group
+            group = group + op if op else group
 
             if group in self.group_betas.keys():
                 weights = self.group_betas[group]
@@ -84,11 +84,12 @@ class DrNASOptimizer(DARTSOptimizer):
 
         """
         super().__init__(config, op_optimizer, arch_optimizer, loss_criteria)
+        self.anchor = None
         self.reg_type = "kl"
         self.reg_scale = 1e-3
         # self.reg_scale = config.reg_scale
         self.epochs = config.search.epochs
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.group_betas = {}
 
     def new_epoch(self, epoch):
@@ -100,11 +101,8 @@ class DrNASOptimizer(DARTSOptimizer):
         If you want to checkpoint the dirichlet 'concentration' parameter (beta) add it to the buffer here.
         """
         super().adapt_search_space(search_space, scope)
-        self.anchor = Dirichlet(
-            torch.ones(
-                torch.nn.utils.parameters_to_vector(self.architectural_weights).shape
-            )
-        )
+        self.anchor = Dirichlet(torch.ones(torch.nn.utils.parameters_to_vector(self.architectural_weights).shape).to(self.device))
+
 
     def step(self, data_train, data_val):
         input_train, target_train = data_train
@@ -126,7 +124,8 @@ class DrNASOptimizer(DARTSOptimizer):
         if self.reg_type == "kl":
             val_loss += self._get_kl_reg()
 
-        val_loss.backward(retain_graph=True)
+        #val_loss.backward(retain_graph=True)
+        val_loss.backward()
 
         if self.grad_clip:
             torch.nn.utils.clip_grad_norm_(
@@ -155,6 +154,7 @@ class DrNASOptimizer(DARTSOptimizer):
         self.op_optimizer.step()
 
         # in order to properly unparse remove the alphas again
+        self.group_betas = {}
         self.graph.update_edges(
             update_func=self.remove_sampled_alphas,
             scope=self.scope,
@@ -171,27 +171,6 @@ class DrNASOptimizer(DARTSOptimizer):
         p = self.anchor
         kl_reg = self.reg_scale * torch.sum(kl_divergence(q, p))
         return kl_reg
-
-    def get_final_architecture(self):
-        logger.info(
-            "Arch weights before discretization: {}".format(
-                [a for a in self.architectural_weights]
-            )
-        )
-        graph = self.graph.clone().unparse()
-        graph.prepare_discretization()
-
-        def discretize_ops(edge):
-            if edge.data.has("alpha"):
-                primitives = edge.data.op.get_embedded_ops()
-                weights = edge.data.op.process_weights(edge.alpha).detach().cpu()
-                edge.data.set("op", primitives[np.argmax(weights)])
-
-        graph.update_edges(discretize_ops, scope=self.scope, private_edge_data=True)
-        graph.prepare_evaluation()
-        graph.parse()
-        graph = graph.to(self.device)
-        return graph
 
 
 class DrNASMixedOp(MixedOp):
@@ -224,15 +203,15 @@ class DrNASMixedOpCross(MixedOp):
     Continous relaxation of the discrete search space.
     """
 
-    def __init__(self, primitives):
+    def __init__(self, primitives, min_cuda_memory=False):
         super().__init__(primitives)
+        self.min_cuda_memory = min_cuda_memory
 
     def get_weights(self, edge_data):
         return edge_data.sampled_arch_weight
 
-
     def process_weights(self, weights):
-        if type(weights)==torch.nn.ParameterList:
+        if type(weights) == torch.nn.ParameterList:
             x1 = torch.softmax(weights[0], dim=-1)
             x2 = torch.softmax(weights[1], dim=-1)
             weights = x1.reshape(x1.shape[0], 1) @ x2.reshape(1, x2.shape[0])

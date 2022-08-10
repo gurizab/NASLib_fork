@@ -12,6 +12,8 @@ import naslib.search_spaces.core.primitives as ops
 
 logger = logging.getLogger(__name__)
 
+def _concat(xs):
+  return torch.cat([x.view(-1) for x in xs])
 
 class DARTSOptimizer(MetaOptimizer):
     """
@@ -207,7 +209,7 @@ class DARTSOptimizer(MetaOptimizer):
         def discretize_ops(edge):
             if edge.data.has("alpha"):
                 primitives = edge.data.op.get_embedded_ops()
-                weights = edge.data.op.process_weights(edge.alpha).detach().cpu()
+                weights = edge.data.op.process_weights(edge.data.alpha).detach().cpu()
                 edge.data.set("op", primitives[np.argmax(weights)])
 
         graph.update_edges(discretize_ops, scope=self.scope, private_edge_data=True)
@@ -236,7 +238,7 @@ class DARTSOptimizer(MetaOptimizer):
             self,
             model,
             criterion,
-            input_train,
+            input_gottrain,
             target_train,
             input_valid,
             target_valid,
