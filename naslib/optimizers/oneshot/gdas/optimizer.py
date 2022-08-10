@@ -80,31 +80,14 @@ class GDASOptimizer(DARTSOptimizer):
         self.tau_curr += self.tau_step
         logger.info("tau {}".format(self.tau_curr))
 
-    def sample_group_alphas(self):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        for k, v in self.groups.items():
-            arch_parameters = torch.unsqueeze(v, dim=0)
-            while True:
-                gumbels = -torch.empty_like(arch_parameters).exponential_().log()
-                gumbels = gumbels.to(device)
-                tau = tau.to(device)
-                arch_parameters = arch_parameters.to(device)
-                logits = (arch_parameters.log_softmax(dim=1) + gumbels) / tau
-                probs = torch.nn.functional.softmax(logits, dim=1)
-                index = probs.max(-1, keepdim=True)[1]
-                one_h = torch.zeros_like(logits).scatter_(-1, index, 1.0)
-                hardwts = one_h - probs.detach() + probs
-                if (
-                        (torch.isinf(gumbels).any())
-                        or (torch.isinf(probs).any())
-                        or (torch.isnan(probs).any())
-                ):
-                    continue
-                else:
-                    break
-            weights = hardwts[0]
-            argmaxs = index[0].item()
-            self.group_gumbels[k] = weights
+    def get_gumbels_arch_param(self,edge):
+        op = edge.data.get("mixed_op_type", None)
+        if op:
+            arch_parameters = edge.data.op.process_weights(edge.data.alpha)
+        else:
+            arch_parameters= edge.data.alpha
+        gumbels = -torch.empty_like(arch_parameters).exponential_().log()
+        return gumbels, arch_parameters
 
     def sample_alphas(self, edge, tau):
         # sampled_arch_weight = torch.nn.functional.gumbel_softmax(
@@ -117,35 +100,49 @@ class GDASOptimizer(DARTSOptimizer):
         # https://github.com/D-X-Y/AutoDL-Projects/blob/befa6bcb00e0a8fcfba447d2a1348202759f58c9/lib/models/cell_searchs/search_cells.py#L51
         group = edge.data.get("group", None)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        if type(edge.data.group) == list:
-            weights = torch.nn.ParameterList([self.group_gumbels[i] for i in group])
-        elif group in self.group_gumbels.keys():
-            weights = self.group_gumbels[group]
-        else:
-            arch_parameters = torch.unsqueeze(edge.data.alpha, dim=0)
-            while True:
-                gumbels = -torch.empty_like(arch_parameters).exponential_().log()
-                gumbels = gumbels.to(device)
-                tau = tau.to(device)
-                arch_parameters = arch_parameters.to(device)
-                logits = (arch_parameters.log_softmax(dim=1) + gumbels) / tau
-                probs = torch.nn.functional.softmax(logits, dim=1)
-                index = probs.max(-1, keepdim=True)[1]
-                one_h = torch.zeros_like(logits).scatter_(-1, index, 1.0)
-                hardwts = one_h - probs.detach() + probs
-                if (
-                        (torch.isinf(gumbels).any())
-                        or (torch.isinf(probs).any())
-                        or (torch.isnan(probs).any())
-                ):
-                    continue
+        group = edge.data.get("group", None)
+        gumbels = None
+        if group:
+            op = edge.data.get("mixed_op_type", None)
+            if edge.data.alpha not in self.sampled_groups.keys():
+                if op and op in self.sampled_groups[edge.data.alpha].keys():
+                    gumbels, arch_parameters = self.sampled_groups[edge.data.alpha][op]
+                elif op:
+                    gumbels, arch_parameters = self.get_gumbels(edge)
+                    self.sampled_groups[edge.data.alpha][op] = (gumbels, arch_parameters)
                 else:
-                    break
-            weights = hardwts[0]
-            argmaxs = index[0].item()
+                    gumbels, arch_parameters = self.sampled_groups[edge.data.alpha]
+            else:
+                gumbels, arch_parameters = self.get_gumbels_arch_param(edge)
+                if op:
+                    self.sampled_groups[edge.data.alpha] = {op: (gumbels, arch_parameters)}
+                else:
+                    self.sampled_groups[edge.data.alpha] = (gumbels, arch_parameters)
+        else:
+            gumbels, arch_parameters = self.get_gumbels_arch_param(edge)
+
+        while True:
+            gumbels = gumbels.to(device)
+            tau = tau.to(device)
+            arch_parameters = arch_parameters.to(device)
+            logits = (arch_parameters.log_softmax(dim=1) + gumbels) / tau
+            probs = torch.nn.functional.softmax(logits, dim=1)
+            index = probs.max(-1, keepdim=True)[1]
+            one_h = torch.zeros_like(logits).scatter_(-1, index, 1.0)
+            hardwts = one_h - probs.detach() + probs
+            if (
+                    (torch.isinf(gumbels).any())
+                    or (torch.isinf(probs).any())
+                    or (torch.isnan(probs).any())
+            ):
+                continue
+            else:
+                break
+        weights = hardwts[0]
+        argmaxs = index[0].item()
 
         edge.data.set("sampled_arch_weight", weights, shared=True)
+        edge.data.set("argmax", argmaxs, shared=True)
 
     @staticmethod
     def remove_sampled_alphas(edge):

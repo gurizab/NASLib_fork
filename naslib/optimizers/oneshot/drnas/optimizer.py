@@ -24,17 +24,54 @@ class DrNASOptimizer(DARTSOptimizer):
     from DARTSOptimizer instead of MetaOptimizer
     """
 
-    def sample_alphas(self, edge):
+    """
 
-        group = edge.data.get("group", None)
-        if type(edge.data.group) == list:
-            weights = torch.nn.ParameterList([self.sampled_groups[i] for i in group])
-        elif group in self.sampled_groups.keys():
-            weights = self.sampled_groups[group]
+        def sample_alphas(self, edge):
+
+            group = edge.data.get("group", None)
+            if type(edge.data.group) == list:
+                beta = edge.data.op.process_weights(edge.data.alpha)
+                if beta in self.sampled_groups.keys():
+                    weights = self.sampled_groups[beta]
+            elif group in self.sampled_groups.keys():
+                weights = self.sampled_groups[group]
+            else:
+                beta = F.elu(edge.data.alpha) + 1
+                weights = torch.distributions.dirichlet.Dirichlet(beta).rsample()
+            edge.data.set("sampled_arch_weight", weights, shared=True)
+
+    """
+
+    def beta(self, edge):
+        op = edge.data.get("mixed_op_type", None)
+        if op:
+            beta = F.elu(edge.data.op.process_weights(edge.data.alpha)) + 1
+            weights = torch.distributions.dirichlet.Dirichlet(beta).rsample()
         else:
             beta = F.elu(edge.data.alpha) + 1
             weights = torch.distributions.dirichlet.Dirichlet(beta).rsample()
-            self.groups[edge.data.group] = weights
+        return weights
+
+    def sample_alphas(self, edge):
+        group = edge.data.get("group", None)
+        if group:
+            op = edge.data.get("mixed_op_type", None)
+            if edge.data.alpha not in self.sampled_groups.keys():
+                if op and op in self.sampled_groups[edge.data.alpha].keys():
+                    weights = self.sampled_groups[edge.data.alpha][op]
+                elif op:
+                    weights = self.beta(edge)
+                    self.sampled_groups[edge.data.alpha][op] = weights
+                else:
+                    weights = self.sampled_groups[edge.data.alpha]
+            else:
+                weights = self.beta(edge)
+                if op:
+                    self.sampled_groups[edge.data.alpha] = {op: weights}
+                else:
+                    self.sampled_groups[edge.data.alpha] = weights
+        else:
+            weights = self.beta(edge)
         edge.data.set("sampled_arch_weight", weights, shared=True)
 
     def sample_group_alphas(self):
@@ -103,7 +140,8 @@ class DrNASOptimizer(DARTSOptimizer):
         input_val, target_val = data_val
 
         # sample weights (alphas) from the dirichlet distribution (parameterized by beta) and set to edges
-        self.sample_group_alphas()
+        # self.sample_group_alphas()
+        self.sampled_groups = {}
         self.graph.update_edges(
             update_func=lambda edge: self.sample_alphas(edge),
             scope=self.scope,
@@ -129,7 +167,8 @@ class DrNASOptimizer(DARTSOptimizer):
         # has to be done again, cause val_loss.backward() frees the gradient from sampled alphas
         # TODO: this is not how it is intended because the samples are now different. Another
         # option would be to set val_loss.backward(retain_graph=True) but that requires more memory.
-        self.sample_group_alphas()
+        # self.sample_group_alphas()
+        self.sampled_groups = {}
         self.graph.update_edges(
             update_func=lambda edge: self.sample_alphas(edge),
             scope=self.scope,
@@ -209,6 +248,7 @@ class DrNASMixedOp(MixedOp):
         )
         return weighted_sum
 
+
 class DrNASMixedOpCross(MixedOp):
     """
     Continous relaxation of the discrete search space.
@@ -221,10 +261,13 @@ class DrNASMixedOpCross(MixedOp):
         return edge_data.sampled_arch_weight
 
     def process_weights(self, weights):
-        weights = torch.softmax(weights, dim=-1)
-        len = weights[0].shape[0]
-        weights = weights[0].reshape(len, 1) @ weights[1].reshape(1, len)
-        return weights.flatten()
+        if type(weights) == torch.nn.ParameterList:
+            weights = torch.softmax(weights, dim=-1)
+            len = weights[0].shape[0]
+            weights = weights[0].reshape(len, 1) @ weights[1].reshape(1, len)
+            return weights.flatten()
+        else:
+            return weights
 
     def apply_weights(self, x, weights):
         weighted_sum = sum(
